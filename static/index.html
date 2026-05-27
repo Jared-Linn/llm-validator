@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM 标注验证系统 · 思路B</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--surface:#161b22;--surface2:#21262d;--border:#30363d;--text:#e6edf3;--text-muted:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff;--cyan:#39d2c0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);line-height:1.6}
+.container{max-width:1400px;margin:0 auto;padding:24px}
+
+/* Header */
+.header{padding:20px 0;border-bottom:1px solid var(--border);margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
+.header h1{font-size:24px;background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header .sub{color:var(--text-muted);font-size:13px;margin-top:2px}
+.header .sub span{background:var(--surface2);padding:2px 8px;border-radius:4px;color:var(--accent);-webkit-text-fill-color:var(--accent);font-size:11px}
+.header-actions{display:flex;gap:8px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:1px solid var(--border);transition:all .15s;text-decoration:none}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}.btn-primary:hover{filter:brightness(1.15)}
+.btn-secondary{background:var(--surface2);color:var(--text);border-color:var(--border)}.btn-secondary:hover{border-color:var(--text-muted)}
+.btn-ghost{background:transparent;color:var(--text-muted);border-color:transparent}.btn-ghost:hover{color:var(--text);background:var(--surface2)}
+.btn-green{background:var(--green);color:#fff;border-color:var(--green)}.btn-green:hover{filter:brightness(1.15)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* Upload Zone */
+.upload-zone{border:2px dashed var(--border);border-radius:16px;padding:60px 40px;text-align:center;cursor:pointer;transition:all .2s;margin-bottom:24px;background:var(--surface)}
+.upload-zone:hover,.upload-zone.dragover{border-color:var(--accent);background:rgba(88,166,255,.05)}
+.upload-zone .icon{font-size:48px;margin-bottom:16px}
+.upload-zone .title{font-size:18px;font-weight:600;margin-bottom:8px}
+.upload-zone .hint{color:var(--text-muted);font-size:13px}
+.upload-zone .hint code{background:var(--surface2);padding:2px 6px;border-radius:4px;font-size:12px}
+.upload-zone input{display:none}
+
+/* Stats Grid */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:20px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 20px;transition:border-color .2s}
+.stat-card:hover{border-color:var(--accent)}
+.stat-card .label{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.stat-card .value{font-size:28px;font-weight:700}
+.stat-card .value.green{color:var(--green)}.stat-card .value.blue{color:var(--accent)}.stat-card .value.purple{color:var(--purple)}.stat-card .value.cyan{color:var(--cyan)}.stat-card .value.yellow{color:var(--yellow)}.stat-card .value.red{color:var(--red)}
+.stat-card .sub{font-size:12px;color:var(--text-muted);margin-top:4px}
+
+/* Charts */
+.charts-row{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:20px}
+.chart-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px}
+.chart-card h3{font-size:13px;color:var(--text-muted);margin-bottom:12px;text-transform:uppercase;letter-spacing:.5px}
+.chart-card .chart-container{position:relative;height:260px}
+
+/* LLM bars */
+.llm-section{margin-bottom:20px}
+.llm-section h3{font-size:13px;color:var(--text-muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+.llm-row{display:flex;align-items:center;margin-bottom:6px}
+.llm-row .llm-name{width:160px;font-size:13px;font-weight:600;flex-shrink:0}
+.llm-row .bar-track{flex:1;height:26px;background:var(--surface2);border-radius:13px;overflow:hidden;position:relative}
+.llm-row .bar-fill{height:100%;border-radius:13px;transition:width .8s ease;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;font-size:11px;font-weight:600;min-width:36px}
+.llm-row .bar-fill.deepseek{background:linear-gradient(90deg,#4fc3f7,#0288d1)}
+.llm-row .bar-fill.claude{background:linear-gradient(90deg,#ce93d8,#7b1fa2)}
+.llm-row .bar-fill.gemini{background:linear-gradient(90deg,#81c784,#388e3c)}
+.llm-row .bar-fill.gpt{background:linear-gradient(90deg,#4dd0e1,#0097a7)}
+.llm-row .bar-fill.other{background:linear-gradient(90deg,#ffb74d,#f57c00)}
+.llm-row .acc-text{width:52px;text-align:right;font-weight:700;font-size:13px;flex-shrink:0;padding-left:6px}
+
+/* Heatmap */
+.heatmap-section{margin-bottom:20px}
+.heatmap-section h3{font-size:13px;color:var(--text-muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+.heatmap-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;font-size:13px}
+.heatmap-table th,.heatmap-table td{padding:10px 14px;text-align:center;border-bottom:1px solid var(--border)}
+.heatmap-table th{background:var(--surface2);font-weight:600;color:var(--text-muted)}
+.heatmap-table td:first-child{text-align:left;font-weight:600}
+.cell-high{background:rgba(63,185,80,.12);color:var(--green);font-weight:600}
+.cell-mid{background:rgba(210,153,34,.12);color:var(--yellow);font-weight:600}
+.cell-low{background:rgba(248,81,73,.12);color:var(--red);font-weight:600}
+
+/* Samples table */
+.samples-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:20px}
+.samples-section h3{font-size:13px;color:var(--text-muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.samples-table{width:100%;border-collapse:collapse;font-size:12px}
+.samples-table th{text-align:left;padding:8px 10px;color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase}
+.samples-table td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+.samples-table tr:hover{background:var(--surface2)}
+.badge{display:inline-block;padding:2px 7px;border-radius:8px;font-size:10px;font-weight:600}
+.badge.s1{background:rgba(88,166,255,.12);color:var(--accent)}
+.badge.s2{background:rgba(188,140,255,.12);color:var(--purple)}
+.badge.s3{background:rgba(248,81,73,.12);color:var(--red)}
+.badge.high{background:rgba(63,185,80,.12);color:var(--green)}
+.badge.medium{background:rgba(210,153,34,.12);color:var(--yellow)}
+.badge.low{background:rgba(248,81,73,.12);color:var(--red)}
+.match{color:var(--green)}.mismatch{color:var(--red)}
+
+/* Stepper */
+.stepper{display:flex;gap:0;margin-bottom:24px;align-items:center}
+.step{display:flex;align-items:center;gap:8px;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;color:var(--text-muted)}
+.step.active{color:var(--accent);background:rgba(88,166,255,.08)}
+.step.done{color:var(--green)}
+.step .num{width:24px;height:24px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:11px;background:var(--surface2)}
+.step.active .num{background:var(--accent);color:#fff}
+.step.done .num{background:var(--green);color:#fff}
+.stepper-arrow{color:var(--border);font-size:16px}
+
+/* Loading */
+.loading-overlay{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px;gap:16px}
+.spinner{width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Info bar */
+.info-bar{background:rgba(88,166,255,.06);border:1px solid rgba(88,166,255,.2);border-radius:10px;padding:12px 16px;font-size:13px;color:var(--accent);margin-bottom:20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.info-bar .btn{font-size:11px;padding:4px 10px}
+
+/* Footer */
+.footer{text-align:center;padding:20px 0;color:var(--text-muted);font-size:11px;border-top:1px solid var(--border);margin-top:20px}
+.footer a{color:var(--accent);text-decoration:none}
+
+/* Error */
+.error-box{background:rgba(248,81,73,.08);border:1px solid var(--red);border-radius:12px;padding:20px;text-align:center;color:var(--red);margin-bottom:20px}
+.error-box .detail{color:var(--text-muted);font-size:12px;margin-top:8px}
+
+/* Tiers */
+.tiers-hint{display:flex;justify-content:center;gap:16px;margin-top:8px;font-size:11px}
+
+/* No labels alert */
+.alert-warn{background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.3);border-radius:12px;padding:24px;text-align:center;margin-bottom:20px}
+.alert-warn .icon{font-size:36px;margin-bottom:12px}
+.alert-warn h3{color:var(--yellow);margin-bottom:8px}
+.alert-warn p{color:var(--text-muted);font-size:13px}
+
+/* Responsive */
+@media (max-width:768px){
+  .charts-row{grid-template-columns:1fr}
+  .stats-grid{grid-template-columns:1fr 1fr}
+  .header{flex-direction:column;align-items:flex-start}
+  .llm-row .llm-name{width:120px}
+  .stat-card .value{font-size:22px}
+}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--surface)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>🧠 LLM 标注验证系统</h1>
+      <div class="sub">多LLM交叉验证 · 思路B · <span>v2.0</span></div>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-ghost" onclick="loadDemo()">📦 加载演示数据</button>
+      <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传数据集</button>
+      <input type="file" id="fileInput" accept=".json" onchange="handleUpload(this.files[0])">
+    </div>
+  </div>
+
+  <!-- Stepper -->
+  <div class="stepper" id="stepper">
+    <div class="step active" id="step1"><span class="num">1</span> 上传数据</div>
+    <span class="stepper-arrow">▸</span>
+    <div class="step" id="step2"><span class="num">2</span> 多LLM验证</div>
+    <span class="stepper-arrow">▸</span>
+    <div class="step" id="step3"><span class="num">3</span> 结果看板</div>
+  </div>
+
+  <!-- Upload zone -->
+  <div class="upload-zone" id="uploadZone"
+       onclick="document.getElementById('fileInput').click()"
+       ondragover="this.classList.add('dragover');event.preventDefault()"
+       ondragleave="this.classList.remove('dragover')"
+       ondrop="event.preventDefault();this.classList.remove('dragover');const f=event.dataTransfer.files[0];if(f)handleUpload(f)">
+    <div class="icon">📂</div>
+    <div class="title">上传你的标注数据集</div>
+    <div class="hint">
+      拖拽 <code>.json</code> 文件到此处，或点击选择文件<br>
+      格式：心理咨询对话数据（含 <code>question_title</code> / <code>question_content</code> 和可选的 <code>labels.label</code>）<br>
+      上限 <strong>200MB</strong> / <strong>50,000 条</strong> · 自动采样 200 条分析
+    </div>
+  </div>
+
+  <!-- Content areas -->
+  <div id="loadingArea" class="loading-overlay" style="display:none">
+    <div class="spinner"></div>
+    <div style="color:var(--text-muted);font-size:14px" id="loadingText">处理中...</div>
+  </div>
+  <div id="errorArea" class="error-box" style="display:none"></div>
+  <div id="warnArea" style="display:none"></div>
+  <div id="infoBar" class="info-bar" style="display:none"></div>
+  <div id="dashboardArea" style="display:none"></div>
+
+  <div class="footer">
+    <a href="https://github.com/Jared-Linn/data-annotation" target="_blank">data-annotation</a>
+    · 滇池学院理工学院 NLP · 思路B 多LLM验证
+  </div>
+</div>
+
+<script>
+let currentSessionId = null;
+let dashboardData = null;
+
+// ── Upload ──
+async function handleUpload(file) {
+  if (!file) return;
+  const ext = file.name.split('.').pop().toLowerCase();
+  if (ext !== 'json') { showError('仅支持 .json 文件'); return; }
+  if (file.size > 200 * 1024 * 1024) { showError(`文件过大 (${(file.size/1024/1024).toFixed(1)}MB)`); return; }
+
+  setStep(1);
+  showLoading('上传数据中...');
+  hideError();
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) { showError(data.detail || '上传失败'); return; }
+
+    currentSessionId = data.session_id;
+    hideLoading();
+    showInfo(`📄 ${data.filename} — ${data.total_records} 条记录，采样 ${data.sampled} 条分析` +
+      (data.has_labels ? '' : ' ⚠️ 未检测到标注标签') +
+      `  <button class="btn btn-green" onclick="startAnalysis('${data.session_id}')">开始验证 →</button>`);
+
+    setStep(1, true);
+    setStep(2, true);
+
+    if (!data.has_labels) {
+      showWarn(
+        '该数据集未包含标注标签',
+        '每条记录需要 <code>labels.label</code> 或 <code>label</code> 字段才能进行多LLM一致性验证。当前仅展示数据概览。'
+      );
+    }
+  } catch(e) { showError(`网络错误: ${e.message}`); }
+}
+
+// ── Analysis ──
+async function startAnalysis(sessionId) {
+  setStep(2, false);
+  showLoading('多LLM交叉验证分析中...');
+  hideError();
+
+  try {
+    const res = await fetch(`/api/analyze/${sessionId}`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) { showError(data.detail || '分析失败'); return; }
+
+    if (data.status === 'no_labels') {
+      hideLoading();
+      const msg = data.message + '<br><br>标签体系参考:<br>S1 日常困扰 | S2 中度障碍 | S3 紧急危机';
+      showWarn('无法验证', msg);
+      return;
+    }
+
+    dashboardData = data;
+    currentSessionId = sessionId;
+    hideLoading();
+    hideWarn();
+    setStep(2, true);
+    setStep(3, true);
+    renderDashboard(data, sessionId);
+  } catch(e) { showError(`分析失败: ${e.message}`); }
+}
+
+// ── Load Demo ──
+async function loadDemo() {
+  showLoading('加载演示数据中...');
+  hideError();
+  try {
+    const res = await fetch('/api/demo');
+    const data = await res.json();
+    if (!res.ok) { showError(data.detail || '加载失败'); return; }
+
+    currentSessionId = data.session_id;
+    dashboardData = data.dashboard;
+    hideLoading();
+    setStep(1, true);
+    setStep(2, true);
+    setStep(3, true);
+    showInfo(`📦 演示数据已加载 — 来自 student-01_labeled_refined.json（200条采样）`);
+    renderDashboard(data.dashboard, data.session_id);
+  } catch(e) { showError(`加载失败: ${e.message}`); }
+}
+
+// ── Render Dashboard ──
+function renderDashboard(d, sessionId) {
+  const area = document.getElementById('dashboardArea');
+  area.style.display = 'block';
+  const ov = d.overview;
+
+  // Stats
+  let html = `<div class="stats-grid">
+    <div class="stat-card">
+      <div class="label">已验证样本</div>
+      <div class="value blue">${ov.total_samples}</div>
+      <div class="sub">分层抽样分析</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">参与LLM数</div>
+      <div class="value purple">${ov.llm_count}</div>
+      <div class="sub">${(ov.llm_list || []).join(' · ')}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Fleiss' Kappa</div>
+      <div class="value ${ov.fleiss_kappa >= 0.6 ? 'green' : ov.fleiss_kappa >= 0.4 ? 'yellow' : 'red'}">${(ov.fleiss_kappa * 100).toFixed(1)}%</div>
+      <div class="sub">多标注者一致性指数</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">全一致率</div>
+      <div class="value cyan">${(ov.overall_agreement * 100).toFixed(1)}%</div>
+      <div class="sub">所有LLM标签完全相同</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">多数一致率</div>
+      <div class="value green">${(ov.majority_agreement * 100).toFixed(1)}%</div>
+      <div class="sub">超过半数LLM同意</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">共识 vs 原始标签</div>
+      <div class="value ${(ov.consensus_vs_gold * 100) >= 80 ? 'green' : 'yellow'}">${(ov.consensus_vs_gold * 100).toFixed(1)}%</div>
+      <div class="sub">多LLM共识与原始标注的一致率</div>
+    </div>
+  </div>`;
+
+  // LLM bars
+  let llmBars = '';
+  const ranking = d.llm_ranking || [];
+  const maxAcc = Math.max(...ranking.map(r => r.accuracy), 0.01);
+  ranking.forEach(r => {
+    const cls = r.llm.includes('DeepSeek') ? 'deepseek' : r.llm.includes('Claude') ? 'claude' : r.llm.includes('Gemini') ? 'gemini' : 'other';
+    const pct = (r.accuracy * 100).toFixed(1);
+    const w = Math.max((r.accuracy / maxAcc) * 100, 5);
+    llmBars += `<div class="llm-row"><div class="llm-name">${r.llm}</div><div class="bar-track"><div class="bar-fill ${cls}" style="width:${w}%">${pct}%</div></div><div class="acc-text">${pct}%</div></div>`;
+  });
+
+  // Heatmap
+  let heatHTML = '<table class="heatmap-table"><thead><tr><th></th>';
+  (ov.llm_list || []).forEach(llm => { heatHTML += `<th>${llm}</th>`; });
+  heatHTML += '</tr></thead><tbody>';
+  (ov.llm_list || []).forEach(llmA => {
+    heatHTML += `<tr><td>${llmA}</td>`;
+    (ov.llm_list || []).forEach(llmB => {
+      const pair = (d.pairwise_matrix || {})[llmA]?.[llmB];
+      if (llmA === llmB) { heatHTML += `<td class="cell-high">100%</td>`; return; }
+      if (!pair) { heatHTML += '<td>-</td>'; return; }
+      const r = pair.ratio;
+      const cls = r >= 0.8 ? 'cell-high' : r >= 0.6 ? 'cell-mid' : 'cell-low';
+      heatHTML += `<td class="${cls}">${(r*100).toFixed(1)}%</td>`;
+    });
+    heatHTML += '</tr>';
+  });
+  heatHTML += '</tbody></table>';
+
+  // Consensus samples table
+  const cd = d.consensus_detail || {};
+  const consensusList = d.consensus_samples || [];
+  const tiers = d.agreement_tiers || {high:0,medium:0,low:0,none:0};
+  const totalTier = tiers.high + tiers.medium + tiers.low + tiers.none;
+
+  let samplesBody = '';
+  consensusList.forEach(s => {
+    const gold = s.gold_label || '?';
+    const consensus = s.consensus_label;
+    const isMatch = gold === consensus;
+    const gl = gold.charAt && gold.charAt(0) === '3' ? 's3' : gold.charAt && gold.charAt(0) === '2' ? 's2' : 's1';
+    const cl = consensus.charAt && consensus.charAt(0) === '3' ? 's3' : consensus.charAt && consensus.charAt(0) === '2' ? 's2' : 's1';
+    const tc = s.agreement_ratio >= 0.8 ? 'high' : s.agreement_ratio >= 0.5 ? 'medium' : 'low';
+    const votesStr = s.votes ? Object.entries(s.votes).map(([k,v])=>k.substring(0,12)+':'+v).join(' ') : '';
+    samplesBody += `<tr><td>${s.idx}</td><td><span class="badge ${gl}">${gold}</span></td><td><span class="badge ${cl}">${consensus}</span></td><td class="${isMatch?'match':'mismatch'}">${isMatch?'✓':'✗'}</td><td><span class="badge ${tc}">${(s.agreement_ratio*100).toFixed(0)}%</span></td><td style="font-size:10px;color:var(--text-muted)">${votesStr}</td></tr>`;
+  });
+
+  html += `
+    <div class="charts-row">
+      <div class="chart-card">
+        <h3>📊 LLM vs 原始标签 — 准确率</h3>
+        <div class="chart-container"><canvas id="perfChart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h3>🎯 一致性分层</h3>
+        <div class="chart-container"><canvas id="tierChart"></canvas></div>
+        <div class="tiers-hint">
+          <span style="color:var(--green)">高 ≥80%: ${tiers.high}</span>
+          <span style="color:var(--yellow)">中 50-80%: ${tiers.medium}</span>
+          <span style="color:var(--red)">低 &lt;50%: ${tiers.low + tiers.none}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="llm-section"><h3>🏆 LLM 准确率排名 (vs 原始标注)</h3>${llmBars}</div>
+    <div class="heatmap-section"><h3>🔄 LLM 两两一致率 (Pairwise Agreement)</h3>${heatHTML}</div>
+
+    <div class="samples-section">
+      <h3>
+        <span>📋 共识 vs 原始标签 — 样本明细</span>
+        <span style="font-size:11px;font-weight:400;color:var(--text-muted)">
+          匹配: <span class="match">${cd.agreed||0}</span>
+          / 不匹配: <span class="mismatch">${(cd.total||0)-(cd.agreed||0)}</span>
+          / 共 ${cd.total||0}
+          <button class="btn btn-ghost" style="margin-left:8px;font-size:11px" onclick="downloadResult('${sessionId}')">⬇️ 下载结果</button>
+        </span>
+      </h3>
+      <table class="samples-table">
+        <thead><tr><th>#</th><th>原始标签</th><th>共识标签</th><th>匹配</th><th>一致率</th><th>各LLM投票</th></tr></thead>
+        <tbody>${samplesBody}</tbody>
+      </table>
+    </div>`;
+
+  area.innerHTML = html;
+
+  // Draw charts
+  setTimeout(() => {
+    const perfData = d.llm_performance || [];
+    const ctx1 = document.getElementById('perfChart');
+    if (ctx1) new Chart(ctx1, {
+      type: 'bar',
+      data: {
+        labels: perfData.map(p => p.name.substring(0,16)),
+        datasets: [{
+          label: '准确率 (%)',
+          data: perfData.map(p => p.accuracy),
+          backgroundColor: perfData.map(p => {
+            if (p.name.includes('DeepSeek')) return '#0288d1';
+            if (p.name.includes('Claude')) return '#7b1fa2';
+            if (p.name.includes('Gemini')) return '#388e3c';
+            return '#58a6ff';
+          }),
+          borderRadius: 6, borderSkipped: false,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        indexAxis: 'y',
+        plugins: {
+          legend: { display: false },
+          tooltip: { backgroundColor: '#21262d',
+            callbacks: { label: ctx => `${perfData[ctx.dataIndex].correct}/${perfData[ctx.dataIndex].total} = ${ctx.raw}%` }
+          }
+        },
+        scales: {
+          x: { min: 0, max: 100, grid: { color: '#21262d' }, ticks: { color: '#8b949e' } },
+          y: { grid: { display: false }, ticks: { color: '#e6edf3', font: { size: 11 } } }
+        }
+      }
+    });
+
+    const ctx2 = document.getElementById('tierChart');
+    if (ctx2) new Chart(ctx2, {
+      type: 'doughnut',
+      data: {
+        labels: ['高一致 (≥80%)', '中一致 (50-80%)', '低一致 (<50%)'],
+        datasets: [{
+          data: [tiers.high, tiers.medium, tiers.low + tiers.none],
+          backgroundColor: ['#3fb950','#d29922','#f85149'],
+          borderColor: '#0d1117', borderWidth: 3,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { color: '#8b949e', padding: 10, font: { size: 10 } } },
+          tooltip: { backgroundColor: '#21262d',
+            callbacks: { label: ctx => `${ctx.label}: ${ctx.raw} 样本 (${((ctx.raw/totalTier)*100).toFixed(0)}%)` }
+          }
+        }, cutout: '65%',
+      }
+    });
+  }, 50);
+}
+
+// ── Download ──
+function downloadResult(sessionId) {
+  if (!sessionId) return;
+  window.open(`/api/download/${sessionId}`, '_blank');
+}
+
+// ── Utils ──
+function setStep(num, done) {
+  for (let i=1; i<=3; i++) {
+    const el = document.getElementById('step'+i);
+    el.className = 'step';
+    if (done && i < num) el.className = 'step done';
+    if (i === num) el.className = done ? 'step done' : 'step active';
+  }
+}
+
+function showLoading(text) {
+  document.getElementById('loadingArea').style.display = 'flex';
+  document.getElementById('loadingText').textContent = text || '处理中...';
+  document.getElementById('uploadZone').style.display = 'none';
+  document.getElementById('dashboardArea').style.display = 'none';
+  document.getElementById('infoBar').style.display = 'none';
+  document.getElementById('warnArea').style.display = 'none';
+}
+function hideLoading() {
+  document.getElementById('loadingArea').style.display = 'none';
+  document.getElementById('uploadZone').style.display = 'block';
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorArea');
+  el.style.display = 'block';
+  el.innerHTML = `❌ ${msg}`;
+  hideLoading();
+}
+function hideError() { document.getElementById('errorArea').style.display = 'none'; }
+
+function showInfo(msg) {
+  const el = document.getElementById('infoBar');
+  el.style.display = 'flex';
+  el.innerHTML = msg;
+}
+function hideInfo() { document.getElementById('infoBar').style.display = 'none'; }
+
+function showWarn(title, detail) {
+  const el = document.getElementById('warnArea');
+  el.style.display = 'block';
+  el.innerHTML = `<div class="alert-warn"><div class="icon">⚠️</div><h3>${title}</h3><p>${detail}</p></div>`;
+}
+function hideWarn() { document.getElementById('warnArea').style.display = 'none'; }
+</script>
+</body>
+</html>
