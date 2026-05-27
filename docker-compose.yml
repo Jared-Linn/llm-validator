@@ -8,8 +8,12 @@ services:
       - "8900:8900"
     volumes:
       - uploads:/app/data/uploads
+      - userdata:/app/validator/data
     environment:
       - TZ=Asia/Shanghai
+      # JWT_SECRET: 生产环境务必设置一个随机长字符串！
+      # 不设置的话容器每次重启 token 都会失效，用户需要重新登录
+      - JWT_SECRET=${JWT_SECRET:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8900/api/status"]
@@ -19,3 +23,4 @@ services:
 
 volumes:
   uploads:
+  userdata:
