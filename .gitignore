@@ -15,3 +15,4 @@ data/uploads/*
 # OS
 .DS_Store
 Thumbs.db
+validator/data/*.db
