@@ -16,3 +16,4 @@ data/uploads/*
 .DS_Store
 Thumbs.db
 validator/data/*.db
+.env
