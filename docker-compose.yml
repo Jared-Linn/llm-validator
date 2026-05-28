@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  validator:
+    build: .
+    container_name: llm-validator
+    ports:
+      - "8900:8900"
+    volumes:
+      - uploads:/app/data/uploads
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8900/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  uploads:
