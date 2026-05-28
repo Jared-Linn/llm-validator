@@ -196,20 +196,59 @@ async def save_config(
     api_key: str = Form(""),
     model: str = Form(""),
     base_url: str = Form(""),
+    label: str = Form(""),
     user: dict = Depends(require_user),
 ):
     """保存 LLM 配置"""
-    result = set_llm_config(user["user_id"], provider, api_key, model, base_url)
+    result = set_llm_config(user["user_id"], provider, api_key, model, base_url, label)
     if not result["ok"]:
         raise HTTPException(400, result["error"])
     return {"ok": True, "message": f"{provider} 配置已保存"}
 
 
+@app.post("/api/user/custom-config")
+async def add_custom_config(
+    label: str = Form(...),
+    api_key: str = Form(...),
+    model: str = Form(""),
+    base_url: str = Form(...),
+    user: dict = Depends(require_user),
+):
+    """添加新的自定义端点"""
+    from validator.auth import add_custom_config as _add_custom
+    result = _add_custom(user["user_id"], label, api_key, model, base_url)
+    if not result["ok"]:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.delete("/api/user/configs/detail/{config_id}")
+async def delete_config_by_id(config_id: int, user: dict = Depends(require_user)):
+    """按 ID 删除配置"""
+    from validator.auth import delete_llm_config_by_id
+    result = delete_llm_config_by_id(user["user_id"], config_id)
+    return {"ok": True}
+
+
 @app.delete("/api/user/configs/{provider}")
 async def delete_config(provider: str, user: dict = Depends(require_user)):
-    """删除 LLM 配置"""
+    """按提供商名删除配置"""
     result = delete_llm_config(user["user_id"], provider)
     return {"ok": True}
+
+
+@app.post("/api/user/configs/{provider}/test")
+async def test_config(
+    provider: str,
+    api_key: str = Form(""),
+    model: str = Form(""),
+    base_url: str = Form(""),
+    user: dict = Depends(require_user),
+):
+    """测试 LLM 配置连接"""
+    from validator.llm_providers import test_llm_connection
+    result = await test_llm_connection(provider, api_key, model, base_url)
+    return result
 
 
 # ══════════════════════════════════════════
@@ -235,7 +274,11 @@ async def status():
 # ══════════════════════════════════════════
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+async def upload_file(
+    file: UploadFile = File(...),
+    sample_size: str = Form("200"),
+    user: dict = Depends(get_current_user),
+):
     if not file.filename or not file.filename.lower().endswith(".json"):
         raise HTTPException(400, "仅支持 .json 文件")
     raw = await file.read()
@@ -252,9 +295,16 @@ async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_cur
     safe_name = _safe_filename(file.filename)
     sample_path = str(UPLOAD_DIR / f"{sid}_samples.json")
 
+    # 采样逻辑
     import random
     random.seed(int(time.time()))
-    sampled = random.sample(data, min(200, len(data)))
+    total = len(data)
+    if sample_size == "all":
+        n = min(total, MAX_RECORDS)
+        sampled = data[:n]  # 全量不随机
+    else:
+        n = min(int(sample_size), total)
+        sampled = random.sample(data, n)
 
     samples = []
     gold_labels = {}
@@ -289,65 +339,149 @@ async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_cur
 
 
 @app.post("/api/analyze/{session_id}")
-async def analyze_session(session_id: str, user: dict = Depends(get_current_user)):
+async def analyze_session(
+    session_id: str,
+    provider_ids: str = Query("", description="逗号分隔的配置 ID 列表，为空则使用全部"),
+    user: dict = Depends(get_current_user),
+):
     with sessions_lock:
         sess = sessions.get(session_id)
     if not sess:
         raise HTTPException(404, "会话不存在或已过期")
-    if not sess["has_labels"]:
-        return {"status": "no_labels", "message": "该数据集不含标注标签，无法进行一致性验证。",
-                "total_records": sess["records"], "samples_preview": sess["samples"][:10],
-                "label_system_hint": "S1(日常困扰) / S2(中度障碍) / S3(紧急危机)"}
 
+    # 解析选中的 provider ID 列表
+    selected_ids = None
+    if provider_ids:
+        try:
+            selected_ids = [int(x) for x in provider_ids.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(400, "provider_ids 格式错误")
+
+    # 初始化进度
+    with sessions_lock:
+        sess["progress"] = {"status": "starting", "current": 0, "total": 0, "llm": ""}
+        sess["has_llm_results"] = False
+
+    # 启动后台分析
+    asyncio.create_task(_run_analysis(session_id, user, selected_ids))
+
+    return {"status": "started", "session_id": session_id, "message": "分析已启动"}
+
+
+async def _run_analysis(session_id: str, user: dict, selected_provider_ids: list = None):
+    """后台运行 LLM 分析"""
+    try:
+        with sessions_lock:
+            sess = sessions.get(session_id)
+        if not sess:
+            return
+
+        samples = sess["samples"]
+        gold_labels = sess["gold_labels"]
+
+        uid = sess.get("user_id") or (user["user_id"] if user else None)
+        user_configs = []
+        if uid:
+            user_configs = get_active_llm_configs(uid, selected_provider_ids)
+            if not user_configs:
+                user_configs = [{"provider": "free", "label": "Free (Simulated)", "api_key": "", "model": "", "base_url": ""}]
+
+        # 进度回调
+        async def on_progress(current, total, llm_name):
+            with sessions_lock:
+                s = sessions.get(session_id)
+                if s:
+                    s["progress"] = {
+                        "status": "running",
+                        "current": current,
+                        "total": total,
+                        "llm": llm_name,
+                    }
+
+        with sessions_lock:
+            s = sessions.get(session_id)
+            if s:
+                s["progress"] = {"status": "running", "current": 0, "total": 0, "llm": ""}
+
+        orchestrator = LLMOrchestrator(user_configs)
+        llm_results = await orchestrator.run_parallel_validation(samples, on_progress)
+
+        with sessions_lock:
+            s = sessions.get(session_id)
+            if s:
+                s["has_llm_results"] = True
+                s["llm_annotations"] = llm_results
+                s["progress"]["status"] = "computing"
+                # 保存 used_providers 供 results 端点使用
+                s["used_providers"] = [
+                    {"provider": cfg["provider"], "name": cfg.get("label", cfg["provider"])}
+                    for cfg in (user_configs or [{"provider": "free", "label": "Free (Simulated)"}])
+                ]
+
+        llm_names = list(llm_results.keys())
+
+        validator = AnnotationValidator()
+        validator.results_cache["llm_annotations"] = llm_results
+        validator.results_cache["gold_labels"] = gold_labels
+        validator.results_cache["samples_count"] = len(samples)
+        validator.results_cache["samples"] = samples
+        summary = validator.compute_summary()
+
+        with sessions_lock:
+            s = sessions.get(session_id)
+            if s:
+                s["summary"] = summary
+
+        result_path = str(UPLOAD_DIR / f"{session_id}_result.json")
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        with sessions_lock:
+            s = sessions.get(session_id)
+            if s:
+                s["result_path"] = result_path
+                s["progress"] = {"status": "done", "current": 1, "total": 1, "llm": ""}
+    except Exception as e:
+        with sessions_lock:
+            s = sessions.get(session_id)
+            if s:
+                s["progress"] = {"status": "error", "current": 0, "total": 0, "llm": str(e)[:100]}
+
+
+@app.get("/api/analyze/{session_id}/progress")
+async def get_analyze_progress(session_id: str):
+    """获取分析进度"""
+    with sessions_lock:
+        sess = sessions.get(session_id)
+    if not sess:
+        raise HTTPException(404, "会话不存在或已过期")
+    progress = dict(sess.get("progress", {}))
+    progress["has_llm_results"] = sess.get("has_llm_results", False)
+    progress["has_summary"] = sess.get("summary") is not None
+    return progress
+
+
+@app.get("/api/analyze/{session_id}/results")
+async def get_analyze_results(session_id: str):
+    """获取分析完成后的结果"""
+    with sessions_lock:
+        sess = sessions.get(session_id)
+    if not sess:
+        raise HTTPException(404, "会话不存在或已过期")
+    if not sess.get("has_llm_results"):
+        raise HTTPException(400, "尚未完成分析")
+    if not sess.get("summary"):
+        raise HTTPException(400, "分析尚未完成")
+
+    summary = sess["summary"]
     samples = sess["samples"]
     gold_labels = sess["gold_labels"]
-
-    # 获取用户的 LLM 配置
-    uid = sess.get("user_id") or (user["user_id"] if user else None)
-    user_configs = []
-    if uid:
-        user_configs = get_active_llm_configs(uid)
-        if not user_configs:
-            # 如果用户有账号但没配置，加个 free 兜底
-            user_configs = [{"provider": "free", "label": "Free (Simulated)", "api_key": "", "model": "", "base_url": ""}]
-
-    # 运行 LLM 验证
-    orchestrator = LLMOrchestrator(user_configs)
-    llm_results = await orchestrator.run_parallel_validation(samples)
-
-    # 如果用的是免费模拟，给 LLM 起个有辨识度的名字
+    llm_results = sess["llm_annotations"]
     llm_names = list(llm_results.keys())
 
-    with sessions_lock:
-        sess["has_llm_results"] = True
-        sess["llm_annotations"] = llm_results
-
-    # 计算指标
-    validator = AnnotationValidator()
-    validator.results_cache["llm_annotations"] = llm_results
-    validator.results_cache["gold_labels"] = gold_labels
-    validator.results_cache["samples_count"] = len(samples)
-    validator.results_cache["samples"] = samples
-    summary = validator.compute_summary()
-
-    with sessions_lock:
-        sess["summary"] = summary
-
-    result_path = str(UPLOAD_DIR / f"{session_id}_result.json")
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    with sessions_lock:
-        sess["result_path"] = result_path
-
-    # 确定使用的模型信息
-    used_providers = []
-    for cfg in (user_configs or [{"provider": "free", "label": "Free (Simulated)"}]):
-        used_providers.append({"provider": cfg["provider"], "name": cfg.get("label", cfg["provider"])})
-
-    return {
-        **dashboard_data(summary, samples, gold_labels, llm_results, llm_names),
-        "used_providers": used_providers,
-    }
+    result = dashboard_data(summary, samples, gold_labels, llm_results, llm_names)
+    result["used_providers"] = sess.get("used_providers", [])
+    return result
 
 
 @app.get("/api/results/{session_id}")
@@ -358,8 +492,10 @@ async def get_results(session_id: str):
         raise HTTPException(404, "会话不存在或已过期")
     if not sess.get("has_llm_results"):
         raise HTTPException(400, "尚未进行分析")
-    return dashboard_data(sess["summary"], sess["samples"], sess["gold_labels"],
+    result = dashboard_data(sess["summary"], sess["samples"], sess["gold_labels"],
                           sess["llm_annotations"], list(sess["llm_annotations"].keys()))
+    result["used_providers"] = sess.get("used_providers", [])
+    return result
 
 
 @app.get("/api/download/{session_id}")
@@ -453,6 +589,7 @@ if static_dir.exists():
 # ══════════════════════════════════════════
 
 def dashboard_data(summary, samples, gold_labels, llm_annotations, llm_list):
+    has_gold = bool(gold_labels)
     return {
         "overview": {
             "total_samples": summary["total_samples"],
@@ -461,7 +598,8 @@ def dashboard_data(summary, samples, gold_labels, llm_annotations, llm_list):
             "fleiss_kappa": summary.get("fleiss_kappa", 0),
             "overall_agreement": summary.get("percentage_agreement", {}).get("overall", 0),
             "majority_agreement": summary.get("percentage_agreement", {}).get("majority", 0),
-            "consensus_vs_gold": summary.get("consensus_vs_gold", {}).get("accuracy", 0),
+            "consensus_vs_gold": summary.get("consensus_vs_gold", {}).get("accuracy", 0) if has_gold else None,
+            "has_gold_labels": has_gold,
         },
         "llm_performance": [
             {"name": llm, "accuracy": round(stats["accuracy"] * 100, 1),
