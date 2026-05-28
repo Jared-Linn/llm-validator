@@ -45,7 +45,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS llm_configs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL REFERENCES users(id),
-            provider TEXT NOT NULL,    -- 'openai' | 'anthropic' | 'deepseek' | 'gemini' | 'custom'
+            provider TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
             model TEXT NOT NULL DEFAULT '',
             api_key TEXT NOT NULL DEFAULT '',
             base_url TEXT NOT NULL DEFAULT '',
@@ -53,6 +54,11 @@ def init_db():
             UNIQUE(user_id, provider)
         );
     """)
+    # 迁移：添加 label 列（如果不存在）
+    try:
+        conn.execute("ALTER TABLE llm_configs ADD COLUMN label TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     conn.commit()
     conn.close()
 
@@ -164,8 +170,8 @@ PROVIDER_META = {
     },
     "deepseek": {
         "label": "DeepSeek",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-        "default_model": "deepseek-chat",
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+        "default_model": "deepseek-v4-flash",
         "default_base_url": "https://api.deepseek.com/v1",
         "needs_key": True,
         "docs_url": "https://platform.deepseek.com/api_keys",
@@ -206,31 +212,61 @@ def get_provider_list() -> list:
 
 
 def set_llm_config(user_id: int, provider: str, api_key: str = "",
-                   model: str = "", base_url: str = "") -> dict:
+                   model: str = "", base_url: str = "", label: str = "") -> dict:
     """保存或更新 LLM 配置"""
     meta = PROVIDER_META.get(provider)
-    if not meta:
+
+    if meta:
+        # 内置提供商
+        if meta["needs_key"] and not api_key:
+            return {"ok": False, "error": f"{meta['label']} 需要填写 API Key"}
+        model = model or meta.get("default_model", "")
+        base_url = base_url or meta.get("default_base_url", "")
+        label = label or meta["label"]
+    elif provider.startswith("custom_"):
+        # 自定义端点 — 跳过验证
+        label = label or "自定义"
+    else:
         return {"ok": False, "error": f"不支持的提供商: {provider}"}
-
-    if meta["needs_key"] and not api_key:
-        return {"ok": False, "error": f"{meta['label']} 需要填写 API Key"}
-
-    model = model or meta.get("default_model", "")
-    base_url = base_url or meta.get("default_base_url", "")
 
     conn = _get_conn()
     try:
         conn.execute("""
-            INSERT INTO llm_configs (user_id, provider, model, api_key, base_url)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO llm_configs (user_id, provider, label, model, api_key, base_url)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, provider) DO UPDATE SET
+                label=excluded.label,
                 model=excluded.model,
                 api_key=excluded.api_key,
                 base_url=excluded.base_url,
                 is_active=1
-        """, (user_id, provider, model, api_key, base_url))
+        """, (user_id, provider, label, model, api_key, base_url))
         conn.commit()
         return {"ok": True}
+    finally:
+        conn.close()
+
+
+def add_custom_config(user_id: int, label: str, api_key: str,
+                      model: str, base_url: str) -> dict:
+    """添加一个新的自定义提供商标识"""
+    if not label.strip():
+        return {"ok": False, "error": "请填写自定义端点名称"}
+    if not api_key:
+        return {"ok": False, "error": "需要填写 API Key"}
+    if not base_url:
+        return {"ok": False, "error": "需要填写接口地址"}
+    provider_id = f"custom_{uuid.uuid4().hex[:8]}"
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO llm_configs (user_id, provider, label, model, api_key, base_url) VALUES (?,?,?,?,?,?)",
+            (user_id, provider_id, label.strip(), model, api_key, base_url)
+        )
+        conn.commit()
+        return {"ok": True, "provider": provider_id}
+    except sqlite3.IntegrityError:
+        return {"ok": False, "error": "创建失败，请重试"}
     finally:
         conn.close()
 
@@ -240,30 +276,55 @@ def get_llm_configs(user_id: int) -> list:
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT provider, model, api_key, base_url, is_active FROM llm_configs WHERE user_id=?",
+            "SELECT id, provider, label, model, api_key, base_url, is_active FROM llm_configs WHERE user_id=?",
             (user_id,),
         ).fetchall()
         configs = []
         for row in rows:
             cfg = dict(row)
-            meta = PROVIDER_META.get(cfg["provider"], {})
-            cfg["label"] = meta.get("label", cfg["provider"])
+            meta = PROVIDER_META.get(cfg["provider"])
+            if meta:
+                cfg["display_label"] = meta.get("label", cfg["label"] or cfg["provider"])
+                cfg["is_builtin"] = True
+            else:
+                cfg["display_label"] = cfg["label"] or cfg["provider"]
+                cfg["is_builtin"] = False
             configs.append(cfg)
+        configs.sort(key=lambda c: (0 if c["is_builtin"] else 1, c["id"]))
         return configs
     finally:
         conn.close()
 
 
-def get_active_llm_configs(user_id: int) -> list:
-    """获取用户已激活的 LLM 配置（有 API key 的）"""
+def get_active_llm_configs(user_id: int, provider_ids: list = None) -> list:
+    """获取用户已激活的 LLM 配置（有 API key 的）
+
+    Args:
+        provider_ids: 可选，指定要返回的配置 ID 列表
+    """
     all_configs = get_llm_configs(user_id)
     active = [c for c in all_configs if c["api_key"] and c["is_active"]]
-    # 如果没有配置任何 LLM，返回空列表（前端会 fallback 到 free）
+    if provider_ids:
+        active = [c for c in active if c["id"] in provider_ids]
     return active
 
 
+def delete_llm_config_by_id(user_id: int, config_id: int) -> dict:
+    """按 ID 删除配置"""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "DELETE FROM llm_configs WHERE user_id=? AND id=?",
+            (user_id, config_id),
+        )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
 def delete_llm_config(user_id: int, provider: str) -> dict:
-    """删除某个 LLM 配置"""
+    """删除某个 LLM 配置（按提供商名）"""
     conn = _get_conn()
     try:
         conn.execute(

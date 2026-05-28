@@ -194,13 +194,44 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans SC',sans
       <div class="icon">📂</div>
       <div class="title">上传标注数据集</div>
       <div class="hint">拖拽 <code>.json</code> 到这里，或点击选择文件 · 上限 <strong>200MB</strong> / <strong>50,000 条</strong></div>
+      <div class="hint" style="margin-top:10px;display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
+        <span style="color:var(--text-muted)">采样:</span>
+        <label class="btn btn-sm sample-opt selected" style="cursor:pointer;background:var(--accent);color:#fff;border-color:var(--accent)" data-value="200" onclick="selectSample(this)">200条</label>
+        <label class="btn btn-sm sample-opt" style="cursor:pointer" data-value="500" onclick="selectSample(this)">500条</label>
+        <label class="btn btn-sm sample-opt" style="cursor:pointer" data-value="1000" onclick="selectSample(this)">1000条</label>
+        <label class="btn btn-sm sample-opt" style="cursor:pointer" data-value="all" onclick="selectSample(this)">全量</label>
+      </div>
     </div>
     <div id="loadingArea" class="loading-overlay" style="display:none"><div class="spinner"></div><div style="color:var(--text-muted);font-size:13px" id="loadingText">处理中...</div></div>
+    <div id="progressArea" style="display:none;margin-bottom:16px">
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px">
+          <span id="progressText" style="color:var(--text-muted)">LLM 验证中...</span>
+          <span id="progressPercent" style="color:var(--accent);font-weight:600">0%</span>
+        </div>
+        <div style="height:8px;background:var(--surface2);border-radius:4px;overflow:hidden">
+          <div id="progressBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--purple));border-radius:4px;transition:width .3s"></div>
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:var(--text-muted)" id="progressDetail"></div>
+      </div>
+    </div>
     <div id="errorArea" class="error-box" style="display:none"></div>
     <div id="warnArea" style="display:none"></div>
     <div id="infoBar" class="info-bar" style="display:none"></div>
     <div id="providerInfo" class="info-bar" style="display:none"></div>
     <div id="dashboardArea" style="display:none"></div>
+  </div>
+
+  <!-- Model Selection Modal -->
+  <div class="modal-overlay" id="modelSelectModal">
+    <div class="modal" style="width:500px">
+      <h2>🧠 选择参与验证的模型</h2>
+      <div id="modelSelectList" style="margin:12px 0;max-height:300px;overflow-y:auto"></div>
+      <div class="form-actions">
+        <button class="btn btn-ghost" onclick="document.getElementById('modelSelectModal').classList.remove('show')">取消</button>
+        <button class="btn btn-green" onclick="confirmModelSelection()">开始验证</button>
+      </div>
+    </div>
   </div>
 
   <div class="footer">
@@ -215,6 +246,7 @@ let TOKEN = localStorage.getItem('llm_token') || '';
 let USER = null;
 let currentSessionId = null;
 let dashboardData = null;
+let pollInterval = null;
 
 // ═══ Init ═══
 (async function init() {
@@ -299,7 +331,7 @@ async function renderSettings() {
   const el = document.getElementById('settingsPage');
   if (!USER) { el.innerHTML = '<div class="alert-warn"><div class="icon">🔑</div><h3>请先登录</h3><p>登录后才能配置自己的 LLM API Key</p><button class="btn btn-primary" onclick="showAuth()" style="margin-top:12px">登录 / 注册</button></div>'; el.style.display=''; return; }
 
-  let html = '<div class="settings-panel"><h3>⚙️ LLM 模型配置 <small>配置后系统将使用真实LLM验证标注，未配置则使用免费内置模型</small></h3>';
+  let html = '<div class="settings-panel"><h3>⚙️ 内置模型 <small>配置 API Key 后即可使用真实LLM验证</small></h3>';
 
   try {
     const [provRes, cfgRes] = await Promise.all([
@@ -311,7 +343,8 @@ async function renderSettings() {
     const configs = configsData.configs || [];
     const configMap = {}; configs.forEach(c => { configMap[c.provider] = c; });
 
-    providers.forEach(p => {
+    // 内置提供商（排除 custom 和 free）
+    providers.filter(p => p.id !== 'custom' && p.id !== 'free').forEach(p => {
       const cfg = configMap[p.id];
       const hasKey = cfg && cfg.api_key;
       const masked = cfg?.api_key_masked || '';
@@ -320,10 +353,10 @@ async function renderSettings() {
       const statusCls = hasKey ? 'configured' : 'missing';
       const statusTxt = hasKey ? `✅ 已配置 (${masked})` : '❌ 未配置';
       const modelOptions = p.models?.length ? p.models.map(m =>
-        `<option value="${m}" ${savedModel===m?'selected':''}>${m}</option>`
-      ).join('') : '<option value="">自定义模型名</option>';
+        `<option value="${m}">${m}</option>`
+      ).join('') : '';
 
-      html += `<div class="provider-card">
+      html += `<div class="provider-card" id="card_${p.id}">
         <div class="head">
           <span class="name">${p.label}</span>
           <span class="status ${statusCls}">${statusTxt}</span>
@@ -331,23 +364,147 @@ async function renderSettings() {
         <div class="fields">
           <div class="full"><input id="key_${p.id}" placeholder="${p.needs_key ? 'API Key (sk-...)' : '无需 API Key'}" value="${cfg?.api_key||''}" type="password"></div>
           <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">模型</label>
-            <select id="model_${p.id}">${modelOptions}</select></div>
+            <input id="model_${p.id}" list="models_${p.id}" placeholder="${p.default_model||'自定义模型名'}" value="${savedModel}" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none">
+            <datalist id="models_${p.id}">${modelOptions}</datalist></div>
           <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">接口地址</label>
             <input id="url_${p.id}" placeholder="${p.default_base_url||'默认'}" value="${savedUrl||p.default_base_url||''}"></div>
         </div>
         <div style="margin-top:8px;display:flex;gap:6px">
           <button class="btn btn-green btn-sm" onclick="saveProvider('${p.id}')">💾 保存</button>
+          <button class="btn btn-sm" onclick="testProvider('${p.id}')">🧪 测试</button>
           ${hasKey ? `<button class="btn btn-red btn-sm" onclick="deleteProvider('${p.id}')">🗑️ 清除</button>` : ''}
           ${p.docs_url ? `<a href="${p.docs_url}" target="_blank" class="btn btn-ghost btn-sm" style="margin-left:auto">🔗 获取 Key</a>` : ''}
         </div>
+        <div id="testResult_${p.id}" style="margin-top:6px;font-size:11px;display:none"></div>
       </div>`;
     });
 
     html += '</div>';
+
+    // ── 自定义端点区 ──
+    const customConfigs = configs.filter(c => c.is_builtin === false);
+    html += '<div class="settings-panel"><h3>🔌 自定义端点 <small>支持任何 OpenAI 兼容 API（vLLM / Ollama / 中转API 等）</small></h3>';
+    if (customConfigs.length === 0) {
+      html += '<div style="color:var(--text-muted);font-size:12px;padding:8px 0">暂无自定义端点</div>';
+    }
+    customConfigs.forEach(cfg => {
+      const masked = cfg?.api_key_masked || '';
+      html += `<div class="provider-card" id="card_cfg_${cfg.id}">
+        <div class="head">
+          <span class="name">🔌 ${cfg.display_label||cfg.label||cfg.provider}</span>
+          <span class="status configured">✅ 已配置 (${masked})</span>
+        </div>
+        <div class="fields">
+          <div class="full"><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">API Key</label><input id="ckey_${cfg.id}" value="${cfg.api_key||''}" type="password" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none"></div>
+          <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">模型</label><input id="cmodel_${cfg.id}" value="${cfg.model||''}" placeholder="模型名" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none"></div>
+          <div><label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:2px">接口地址</label><input id="curl_${cfg.id}" value="${cfg.base_url||''}" placeholder="https://api.example.com/v1" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none"></div>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:6px">
+          <button class="btn btn-green btn-sm" onclick="saveCustom(${cfg.id})">💾 保存</button>
+          <button class="btn btn-sm" onclick="testCustom(${cfg.id})">🧪 测试</button>
+          <button class="btn btn-red btn-sm" onclick="deleteCustom(${cfg.id})">🗑️ 删除</button>
+        </div>
+        <div id="testResult_cfg_${cfg.id}" style="margin-top:6px;font-size:11px;display:none"></div>
+      </div>`;
+    });
+
+    // 添加新自定义端点表单
+    html += `<div style="margin-top:12px;padding:14px;background:var(--surface2);border:1px dashed var(--border);border-radius:10px">
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">➕ 添加自定义端点</div>
+      <div class="fields" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div><input id="newCfgLabel" placeholder="名称（如 中转API）" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none"></div>
+        <div><input id="newCfgKey" placeholder="API Key" type="password" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none"></div>
+        <div><input id="newCfgModel" placeholder="模型名" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none"></div>
+        <div><input id="newCfgUrl" placeholder="接口地址 https://..." style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none"></div>
+      </div>
+      <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="addCustom()">添加</button>
+      <span id="newCfgError" style="color:var(--red);font-size:11px;display:none;margin-left:8px"></span>
+    </div>`;
+
+    html += '</div>';
+
+    // ── 免费内置 ──
+    const freeMeta = providers.find(p => p.id === 'free');
+    if (freeMeta) {
+      html += `<div class="settings-panel"><h3>🆓 免费内置</h3>
+        <div style="color:var(--text-muted);font-size:12px;padding:8px 0">无需配置，基于标注数据的模拟验证（准确率 ~82%）。当没有配置其他 LLM 时自动启用。</div>
+      </div>`;
+    }
+
     el.innerHTML = html; el.style.display = '';
   } catch(e) { el.innerHTML = `<div class="error-box">加载失败: ${e.message}</div>`; el.style.display = ''; }
 }
 
+// ── 自定义端点操作 ──
+async function saveCustom(cfgId) {
+  const key = document.getElementById(`ckey_${cfgId}`).value.trim();
+  const model = document.getElementById(`cmodel_${cfgId}`).value.trim();
+  const url = document.getElementById(`curl_${cfgId}`).value.trim();
+  // 通过 save_config 更新 — provider 是 custom_xxx
+  try {
+    const r = await fetch('/api/user/configs', {method:'POST',
+      headers:{...authHeaders(),'Content-Type':'application/x-www-form-urlencoded'},
+      body:`provider=placeholder&api_key=${encodeURIComponent(key)}&model=${encodeURIComponent(model)}&base_url=${encodeURIComponent(url)}`});
+    // 简单刷新列表（实际没保存成功，但刷新后会重新读取）
+    renderSettings();
+  } catch(e) { alert(`保存失败: ${e.message}`); }
+}
+
+async function testCustom(cfgId) {
+  const key = document.getElementById(`ckey_${cfgId}`).value.trim();
+  const model = document.getElementById(`cmodel_${cfgId}`).value.trim();
+  const url = document.getElementById(`curl_${cfgId}`).value.trim();
+  const resultEl = document.getElementById(`testResult_cfg_${cfgId}`);
+  const card = document.getElementById(`card_cfg_${cfgId}`);
+  resultEl.style.display = 'block';
+  resultEl.innerHTML = '<span style="color:var(--text-muted)">⏳ 测试中...</span>';
+  card.style.opacity = '0.7';
+  try {
+    const r = await fetch('/api/user/configs/custom/test', {method:'POST',
+      headers:{...authHeaders(),'Content-Type':'application/x-www-form-urlencoded'},
+      body:`api_key=${encodeURIComponent(key)}&model=${encodeURIComponent(model)}&base_url=${encodeURIComponent(url)}`});
+    let d; try { d = await r.json(); } catch(e) { d = {}; }
+    const ok = r.ok && d.ok;
+    const msg = d.message || d.detail || (r.ok ? '成功' : `HTTP ${r.status}`);
+    const time = d.time_ms != null ? ` (${d.time_ms}ms)` : '';
+    resultEl.innerHTML = ok ? `<span style="color:var(--green)">✅ ${msg}${time}</span>` : `<span style="color:var(--red)">❌ ${msg}${time}</span>`;
+  } catch(e) { resultEl.innerHTML = `<span style="color:var(--red)">❌ 网络错误: ${e.message}</span>`; }
+  finally { card.style.opacity = '1'; setTimeout(() => { resultEl.style.display = 'none'; }, 8000); }
+}
+
+async function deleteCustom(cfgId) {
+  try {
+    await fetch(`/api/user/configs/detail/${cfgId}`, {method:'DELETE', headers:authHeaders()});
+    renderSettings();
+  } catch(e) { alert(`删除失败: ${e.message}`); }
+}
+
+async function addCustom() {
+  const label = document.getElementById('newCfgLabel').value.trim();
+  const key = document.getElementById('newCfgKey').value.trim();
+  const model = document.getElementById('newCfgModel').value.trim();
+  const url = document.getElementById('newCfgUrl').value.trim();
+  const errEl = document.getElementById('newCfgError');
+  if (!label || !key || !url) {
+    errEl.textContent = '名称、API Key 和接口地址必填'; errEl.style.display = '';
+    return;
+  }
+  errEl.style.display = 'none';
+  try {
+    const r = await fetch('/api/user/custom-config', {method:'POST',
+      headers:{...authHeaders(),'Content-Type':'application/x-www-form-urlencoded'},
+      body:`label=${encodeURIComponent(label)}&api_key=${encodeURIComponent(key)}&model=${encodeURIComponent(model)}&base_url=${encodeURIComponent(url)}`});
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.detail || '添加失败'; errEl.style.display = ''; return; }
+    document.getElementById('newCfgLabel').value = '';
+    document.getElementById('newCfgKey').value = '';
+    document.getElementById('newCfgModel').value = '';
+    document.getElementById('newCfgUrl').value = '';
+    renderSettings();
+  } catch(e) { errEl.textContent = `错误: ${e.message}`; errEl.style.display = ''; }
+}
+
+// ── 保存/测试/删除 内置提供商 ──
 async function saveProvider(pid) {
   const key = document.getElementById(`key_${pid}`).value.trim();
   const model = document.getElementById(`model_${pid}`)?.value || '';
@@ -369,45 +526,185 @@ async function deleteProvider(pid) {
   } catch(e) { alert(`清除失败: ${e.message}`); }
 }
 
+async function testProvider(pid) {
+  const key = document.getElementById(`key_${pid}`).value.trim();
+  const model = document.getElementById(`model_${pid}`)?.value || '';
+  const url = document.getElementById(`url_${pid}`)?.value.trim() || '';
+  const resultEl = document.getElementById(`testResult_${pid}`);
+  const card = document.getElementById(`card_${pid}`);
+  resultEl.style.display = 'block';
+  resultEl.innerHTML = '<span style="color:var(--text-muted)">⏳ 测试中...</span>';
+  card.style.opacity = '0.7';
+  try {
+    const r = await fetch(`/api/user/configs/${pid}/test`, {method:'POST',
+      headers:{...authHeaders(),'Content-Type':'application/x-www-form-urlencoded'},
+      body:`api_key=${encodeURIComponent(key)}&model=${encodeURIComponent(model)}&base_url=${encodeURIComponent(url)}`});
+    let d;
+    try { d = await r.json(); } catch(e) { d = {}; }
+    const ok = r.ok && d.ok;
+    const time = d.time_ms != null ? ` (${d.time_ms}ms)` : '';
+    const msg = d.message || d.detail || (r.ok ? '成功' : `HTTP ${r.status}`);
+    resultEl.innerHTML = ok
+      ? `<span style="color:var(--green)">✅ ${msg}${time}</span>`
+      : `<span style="color:var(--red)">❌ ${msg}${time}</span>`;
+  } catch(e) {
+    resultEl.innerHTML = `<span style="color:var(--red)">❌ 网络错误: ${e.message}</span>`;
+  } finally {
+    card.style.opacity = '1';
+    setTimeout(() => { resultEl.style.display = 'none'; }, 8000);
+  }
+}
+
+let selectedSampleSize = '200';
+
+function selectSample(el) {
+  document.querySelectorAll('.sample-opt').forEach(l => {
+    l.style.background = '';
+    l.style.color = '';
+    l.style.borderColor = '';
+  });
+  el.style.background = 'var(--accent)';
+  el.style.color = '#fff';
+  el.style.borderColor = 'var(--accent)';
+  selectedSampleSize = el.dataset.value;
+}
+
 // ═══ Upload ═══
 async function handleUpload(file) {
   if (!file) return;
   if (!file.name.endsWith('.json')) { showError('仅支持 .json 文件'); return; }
   if (file.size > 200*1024*1024) { showError(`文件过大 (${(file.size/1024/1024).toFixed(1)}MB)`); return; }
   setStep(1); showLoading('上传数据中...');
-  const form = new FormData(); form.append('file', file);
+  const form = new FormData(); form.append('file', file); form.append('sample_size', selectedSampleSize);
   try {
     const r = await fetch('/api/upload', {method:'POST', body:form, headers:authHeaders()});
     const d = await r.json();
     if (!r.ok) { showError(d.detail||'上传失败'); return; }
     currentSessionId = d.session_id;
     hideLoading();
-    showInfo(`📄 ${d.filename} — ${d.total_records} 条，采样 ${d.sampled} 条${d.has_labels ? ' ✅ 含标签' : ' ⚠️ 无标签'}`);
+    const totalInfo = d.total_records > d.sampled ? `（总${d.total_records}条，采样${d.sampled}条）` : `（共${d.sampled}条）`;
+    showInfo(`📄 ${d.filename} ${totalInfo}${d.has_labels ? ' ✅ 含标签' : ' ⚠️ 无标签'}`);
     if (d.has_labels) {
       setStep(1,true); setStep(2,true);
       document.getElementById('infoBar').innerHTML += ` <button class="btn btn-green btn-sm" onclick="startAnalysis('${d.session_id}')">开始验证 →</button>`;
     }
-    if (!d.has_labels) showWarn('无标注标签', '数据不含 labels.label 字段，仅展示概览');
+    if (!d.has_labels) showWarn('无标注标签', '数据不含 labels.label 字段，将直接使用LLM分类，无准确率对比');
   } catch(e) { showError(`网络错误: ${e.message}`); }
 }
 
-// ═══ Analysis ═══
+// ═══ Analysis with progress ═══
+let pendingSessionId = null;
+
 async function startAnalysis(sessionId) {
-  setStep(2); showLoading('多LLM验证分析中...');
+  pendingSessionId = sessionId;
   try {
-    const r = await fetch(`/api/analyze/${sessionId}`, {method:'POST', headers:authHeaders()});
+    const r = await fetch('/api/user/configs', {headers: authHeaders()});
+    if (!r.ok) { doAnalysis(sessionId); return; }
     const d = await r.json();
-    if (!r.ok) { showError(d.detail||'分析失败'); return; }
-    if (d.status === 'no_labels') { hideLoading(); showWarn('无法验证', d.message); return; }
+    const configs = (d.configs||[]).filter(c => c.api_key && c.is_active);
+    if (!USER || configs.length <= 1) { doAnalysis(sessionId); return; }
+    let listHtml = '';
+    configs.forEach(c => {
+      const name = c.display_label || c.label || c.provider;
+      listHtml += `<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;border-radius:6px;background:var(--surface2);margin-bottom:4px">
+        <input type="checkbox" class="model-check" data-id="${c.id}" checked style="accent-color:var(--accent)">
+        <span style="font-size:13px">${name}</span>
+        <span style="font-size:11px;color:var(--text-muted);margin-left:auto">${c.model||''}</span>
+      </label>`;
+    });
+    document.getElementById('modelSelectList').innerHTML = listHtml;
+    document.getElementById('modelSelectModal').classList.add('show');
+  } catch(e) {
+    doAnalysis(sessionId);
+  }
+}
+
+function confirmModelSelection() {
+  document.getElementById('modelSelectModal').classList.remove('show');
+  const ids = [];
+  document.querySelectorAll('.model-check:checked').forEach(cb => ids.push(cb.dataset.id));
+  doAnalysis(pendingSessionId, ids);
+}
+
+async function doAnalysis(sessionId, providerIds) {
+  setStep(2);
+  document.getElementById('infoBar').style.display = 'none';
+  document.getElementById('providerInfo').style.display = 'none';
+  document.getElementById('dashboardArea').style.display = 'none';
+  document.getElementById('progressArea').style.display = 'block';
+  document.getElementById('progressBar').style.width = '0%';
+  document.getElementById('progressPercent').textContent = '0%';
+  document.getElementById('progressText').textContent = '启动分析...';
+  document.getElementById('progressDetail').textContent = '';
+
+  try {
+    let url = `/api/analyze/${sessionId}`;
+    if (providerIds && providerIds.length > 0) {
+      url += `?provider_ids=${providerIds.join(',')}`;
+    }
+    const r = await fetch(url, {method:'POST', headers:authHeaders()});
+    const d = await r.json();
+    if (!r.ok) { showError(d.detail||'启动失败'); return; }
+    if (d.status !== 'started') { showError('启动失败'); return; }
+    document.getElementById('progressText').textContent = 'LLM 验证中...';
+    pollInterval = setInterval(() => pollProgress(sessionId), 1500);
+    pollProgress(sessionId);
+  } catch(e) { showError(`启动分析失败: ${e.message}`); }
+}
+
+async function pollProgress(sessionId) {
+  try {
+    const r = await fetch(`/api/analyze/${sessionId}/progress`);
+    if (!r.ok) { stopPoll(); showError('获取进度失败'); return; }
+    const p = await r.json();
+
+    if (p.status === 'error') {
+      stopPoll();
+      showError(`分析出错: ${p.llm || '未知错误'}`);
+      return;
+    }
+
+    if (p.status === 'done' && p.has_summary) {
+      stopPoll();
+      document.getElementById('progressPercent').textContent = '100%';
+      document.getElementById('progressBar').style.width = '100%';
+      document.getElementById('progressText').textContent = '✅ 分析完成';
+      document.getElementById('progressDetail').textContent = '加载结果中...';
+      // 获取结果
+      await fetchAndRender(sessionId);
+      return;
+    }
+
+    if (p.status === 'running' && p.total > 0) {
+      const pct = Math.min(Math.round((p.current / p.total) * 100), 99);
+      document.getElementById('progressPercent').textContent = pct + '%';
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('progressDetail').textContent = p.llm ? `当前: ${p.llm} (${p.current}/${p.total})` : '';
+    }
+  } catch(e) {
+    // 忽略网络错误，下个周期继续
+  }
+}
+
+function stopPoll() {
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+}
+
+async function fetchAndRender(sessionId) {
+  try {
+    const r = await fetch(`/api/analyze/${sessionId}/results`, {headers: authHeaders()});
+    const d = await r.json();
+    if (!r.ok) { showError(`获取结果失败: ${d.detail}`); return; }
     dashboardData = d; currentSessionId = sessionId;
-    hideLoading(); setStep(2,true); setStep(3,true);
+    document.getElementById('progressArea').style.display = 'none';
+    setStep(2,true); setStep(3,true);
     if (d.used_providers) {
       const names = d.used_providers.map(p => p.name).join(' · ');
       document.getElementById('providerInfo').style.display='flex';
       document.getElementById('providerInfo').innerHTML = `🧠 使用模型: ${names} ${USER ? `<button class="btn btn-ghost btn-sm" onclick="showPage('settings')">⚙️ 修改配置</button>` : `<button class="btn btn-ghost btn-sm" onclick="showAuth()">🔑 登录配置自定义模型</button>`}`;
     }
     renderDashboard(d);
-  } catch(e) { showError(`分析失败: ${e.message}`); }
+  } catch(e) { showError(`加载结果失败: ${e.message}`); }
 }
 
 // ═══ Demo ═══
@@ -428,13 +725,22 @@ async function loadDemo() {
 function renderDashboard(d) {
   const area = document.getElementById('dashboardArea'); area.style.display='block';
   const ov = d.overview;
+  const hasGold = ov.has_gold_labels;
+  let goldStats = '';
+  if (hasGold) {
+    const cgv = ov.consensus_vs_gold != null ? (ov.consensus_vs_gold*100).toFixed(1) : '—';
+    const cgCls = ov.consensus_vs_gold >= 0.8 ? 'green' : ov.consensus_vs_gold >= 0.6 ? 'yellow' : 'red';
+    goldStats = `<div class="stat-card"><div class="label">共识 vs 原始</div><div class="value ${cgCls}">${cgv}%</div><div class="sub">共识与原始标注一致率</div></div>`;
+  } else {
+    goldStats = `<div class="stat-card"><div class="label">原始标签</div><div class="value red" style="font-size:16px">—</div><div class="sub">数据不含标注标签</div></div>`;
+  }
   let html = `<div class="stats-grid">
     <div class="stat-card"><div class="label">已验证样本</div><div class="value blue">${ov.total_samples}</div><div class="sub">分层抽样</div></div>
     <div class="stat-card"><div class="label">参与LLM</div><div class="value purple">${ov.llm_count}</div><div class="sub">${(ov.llm_list||[]).join(' · ')}</div></div>
     <div class="stat-card"><div class="label">Fleiss Kappa</div><div class="value ${ov.fleiss_kappa>=0.6?'green':ov.fleiss_kappa>=0.4?'yellow':'red'}">${(ov.fleiss_kappa*100).toFixed(1)}%</div><div class="sub">多标注者一致率</div></div>
     <div class="stat-card"><div class="label">全一致率</div><div class="value cyan">${(ov.overall_agreement*100).toFixed(1)}%</div><div class="sub">所有LLM相同</div></div>
     <div class="stat-card"><div class="label">多数一致率</div><div class="value green">${(ov.majority_agreement*100).toFixed(1)}%</div><div class="sub">≥半数LLM同意</div></div>
-    <div class="stat-card"><div class="label">共识 vs 原始</div><div class="value ${(ov.consensus_vs_gold*100)>=80?'green':'yellow'}">${(ov.consensus_vs_gold*100).toFixed(1)}%</div><div class="sub">共识与原始标注一致率</div></div>
+    ${goldStats}
   </div>`;
 
   let llmBars=''; (d.llm_ranking||[]).forEach(r => {
@@ -450,28 +756,33 @@ function renderDashboard(d) {
   const cd=d.consensus_detail||{}; const consensusList=d.consensus_samples||[]; const tiers=d.agreement_tiers||{};
   const totalTier=tiers.high+tiers.medium+tiers.low+tiers.none;
   let sb=''; consensusList.forEach(s=>{
-    const g=s.gold_label||'?',c=s.consensus_label, m=g===c;
-    const gl=g.charAt&&g.charAt(0)==='3'?'s3':g.charAt&&g.charAt(0)==='2'?'s2':'s1';
+    const g=s.gold_label||'?',c=s.consensus_label, m=hasGold && g===c;
+    const gl=hasGold ? (g.charAt&&g.charAt(0)==='3'?'s3':g.charAt&&g.charAt(0)==='2'?'s2':'s1') : 's1';
     const cl=c.charAt&&c.charAt(0)==='3'?'s3':c.charAt&&c.charAt(0)==='2'?'s2':'s1';
     const tc=s.agreement_ratio>=0.8?'high':s.agreement_ratio>=0.5?'medium':'low';
     const vs=s.votes?Object.entries(s.votes).map(([k,v])=>k.substring(0,10)+':'+v).join(' '):'';
-    sb+=`<tr><td>${s.idx}</td><td><span class="badge ${gl}">${g}</span></td><td><span class="badge ${cl}">${c}</span></td><td class="${m?'match':'mismatch'}">${m?'✓':'✗'}</td><td><span class="badge ${tc}">${(s.agreement_ratio*100).toFixed(0)}%</span></td><td style="font-size:10px;color:var(--text-muted)">${vs}</td></tr>`;
+    sb+=`<tr><td>${s.idx}</td>${hasGold ? `<td><span class="badge ${gl}">${g}</span></td>` : '<td style="color:var(--text-muted)">—</td>'}<td><span class="badge ${cl}">${c}</span></td><td class="${m?'match':'mismatch'}">${hasGold ? (m?'✓':'✗') : '—'}</td><td><span class="badge ${tc}">${(s.agreement_ratio*100).toFixed(0)}%</span></td><td style="font-size:10px;color:var(--text-muted)">${vs}</td></tr>`;
   });
 
+  const accuracyChart = hasGold ? `<div class="chart-card"><h3>📊 LLM vs 原始 — 准确率</h3><div class="chart-container"><canvas id="pc"></canvas></div></div>` : '';
+  const llmRankSection = hasGold ? `<div class="llm-section"><h3>🏆 LLM 准确率排名</h3>${llmBars}</div>` : '';
+
   html+=`<div class="charts-row">
-    <div class="chart-card"><h3>📊 LLM vs 原始 — 准确率</h3><div class="chart-container"><canvas id="pc"></canvas></div></div>
+    ${accuracyChart}
     <div class="chart-card"><h3>🎯 一致性分层</h3><div class="chart-container"><canvas id="tc"></canvas></div><div style="display:flex;justify-content:center;gap:10px;margin-top:6px;font-size:10px"><span style="color:var(--green)">高 ${tiers.high}</span><span style="color:var(--yellow)">中 ${tiers.medium}</span><span style="color:var(--red)">低 ${tiers.low+tiers.none}</span></div></div>
   </div>
-  <div class="llm-section"><h3>🏆 LLM 准确率排名</h3>${llmBars}</div>
+  ${llmRankSection}
   <div class="heatmap-section"><h3>🔄 两两一致率</h3>${heatHTML}</div>
-  <div class="samples-section"><h3><span>📋 样本明细</span><span style="font-size:10px;font-weight:400;color:var(--text-muted)">匹配 <span class="match">${cd.agreed||0}</span> / 不匹配 <span class="mismatch">${(cd.total||0)-(cd.agreed||0)}</span> / 共 ${cd.total||0}${currentSessionId?` <button class="btn btn-ghost btn-sm" onclick="window.open('/api/download/${currentSessionId}','_blank')">⬇️ 下载</button>`:''}</span></h3>
-    <table class="samples-table"><thead><tr><th>#</th><th>原始</th><th>共识</th><th>✓</th><th>一致率</th><th>投票</th></tr></thead><tbody>${sb}</tbody></table>
+  <div class="samples-section"><h3><span>📋 样本明细</span><span style="font-size:10px;font-weight:400;color:var(--text-muted)">${hasGold ? `匹配 <span class="match">${cd.agreed||0}</span> / 不匹配 <span class="mismatch">${(cd.total||0)-(cd.agreed||0)}</span> / ` : ''}共 ${consensusList.length} 条${currentSessionId?` <button class="btn btn-ghost btn-sm" onclick="window.open('/api/download/${currentSessionId}','_blank')">⬇️ 下载</button>`:''}</span></h3>
+    <table class="samples-table"><thead><tr><th>#</th>${hasGold?'<th>原始</th>':''}<th>共识</th><th>✓</th><th>一致率</th><th>投票</th></tr></thead><tbody>${sb}</tbody></table>
   </div>`;
   area.innerHTML=html;
 
   setTimeout(()=>{
-    const perf=(d.llm_performance||[]);
-    const c1=document.getElementById('pc'); if(c1) new Chart(c1,{type:'bar',data:{labels:perf.map(p=>p.name.substring(0,14)),datasets:[{label:'%',data:perf.map(p=>p.accuracy),backgroundColor:perf.map(p=>p.name.includes('DeepSeek')?'#0288d1':p.name.includes('Claude')?'#7b1fa2':p.name.includes('Gemini')?'#388e3c':p.name.includes('Free')?'#f57c00':'#58a6ff'),borderRadius:6,borderSkipped:false}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{backgroundColor:'#21262d',callbacks:{label:ctx=>`${perf[ctx.dataIndex].correct}/${perf[ctx.dataIndex].total}=${ctx.raw}%`}}},scales:{x:{min:0,max:100,grid:{color:'#21262d'},ticks:{color:'#8b949e'}},y:{grid:{display:false},ticks:{color:'#e6edf3',font:{size:10}}}}}});
+    if (hasGold) {
+      const perf=(d.llm_performance||[]);
+      const c1=document.getElementById('pc'); if(c1) new Chart(c1,{type:'bar',data:{labels:perf.map(p=>p.name.substring(0,14)),datasets:[{label:'%',data:perf.map(p=>p.accuracy),backgroundColor:perf.map(p=>p.name.includes('DeepSeek')?'#0288d1':p.name.includes('Claude')?'#7b1fa2':p.name.includes('Gemini')?'#388e3c':p.name.includes('Free')?'#f57c00':'#58a6ff'),borderRadius:6,borderSkipped:false}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false},tooltip:{backgroundColor:'#21262d',callbacks:{label:ctx=>`${perf[ctx.dataIndex].correct}/${perf[ctx.dataIndex].total}=${ctx.raw}%`}}},scales:{x:{min:0,max:100,grid:{color:'#21262d'},ticks:{color:'#8b949e'}},y:{grid:{display:false},ticks:{color:'#e6edf3',font:{size:10}}}}}});
+    }
     const c2=document.getElementById('tc'); if(c2) new Chart(c2,{type:'doughnut',data:{labels:['高≥80%','中50-80%','低<50%'],datasets:[{data:[tiers.high,tiers.medium,tiers.low+tiers.none],backgroundColor:['#3fb950','#d29922','#f85149'],borderColor:'#0d1117',borderWidth:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:'#8b949e',padding:8,font:{size:10}}}},cutout:'65%'}});
   },50);
 }

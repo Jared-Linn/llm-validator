@@ -239,6 +239,13 @@ PROVIDER_CLASSES = {
 }
 
 
+def _resolve_provider_class(provider_id: str):
+    """解析 provider ID 到对应的类，支持 custom_* 前缀"""
+    if provider_id.startswith("custom_"):
+        return OpenAICompatibleProvider
+    return PROVIDER_CLASSES.get(provider_id)
+
+
 class LLMOrchestrator:
     """LLM 编排器 — 根据用户配置选择可用的 LLM 并行验证"""
 
@@ -251,7 +258,7 @@ class LLMOrchestrator:
 
         for cfg in self.user_configs:
             provider_id = cfg["provider"]
-            cls = PROVIDER_CLASSES.get(provider_id)
+            cls = _resolve_provider_class(provider_id)
             if not cls:
                 continue
             if not cfg.get("api_key") and provider_id != "free":
@@ -259,9 +266,16 @@ class LLMOrchestrator:
 
             if provider_id == "free":
                 p = FreeSimulatedProvider()
-            elif provider_id in ("openai", "deepseek", "custom"):
+            elif provider_id in ("openai", "deepseek"):
                 p = OpenAICompatibleProvider(
                     name=cfg.get("label", provider_id),
+                    model=cfg.get("model", ""),
+                    api_key=cfg.get("api_key", ""),
+                    base_url=cfg.get("base_url", ""),
+                )
+            elif provider_id.startswith("custom_") or provider_id == "custom":
+                p = OpenAICompatibleProvider(
+                    name=cfg.get("label", cfg.get("display_label", "自定义")),
                     model=cfg.get("model", ""),
                     api_key=cfg.get("api_key", ""),
                     base_url=cfg.get("base_url", ""),
@@ -303,27 +317,42 @@ class LLMOrchestrator:
         return providers
 
     async def run_parallel_validation(
-        self, samples: List[Dict]
+        self, samples: List[Dict], progress_callback=None
     ) -> Dict[str, List[Dict]]:
         """并行调用所有可用的 LLM 进行验证
+
+        Args:
+            samples: 样本列表
+            progress_callback: 可选进度回调 async fn(current, total, llm_name)
 
         Returns:
             {provider_name: [{"idx": int, "label": str, "confidence": float}, ...]}
         """
         providers = self.get_providers(samples)
         results = {}
-
-        # 分批：每批 20 条
         batch_size = 20
+
+        # 计算总批次数
+        total_batches = 0
+        for provider in providers:
+            n_batches = (len(samples) + batch_size - 1) // batch_size
+            total_batches += n_batches
+        current_batch = 0
+
         for provider in providers:
             provider_results = []
+            n_batches = (len(samples) + batch_size - 1) // batch_size
             for i in range(0, len(samples), batch_size):
                 batch = samples[i:i + batch_size]
+                current_batch += 1
+                if progress_callback:
+                    await progress_callback(
+                        current_batch, total_batches, provider.name
+                    )
                 try:
                     batch_results = await provider.classify_batch(batch)
                     provider_results.extend(batch_results)
                 except Exception as e:
-                    # 失败时 fallback
                     provider_results.extend([
                         {"idx": s["idx"], "label": "1.17", "confidence": 0.5,
                          "reasoning": f"error: {str(e)[:50]}"}
@@ -332,6 +361,64 @@ class LLMOrchestrator:
             results[provider.name] = provider_results
 
         return results
+
+
+# ── 连接测试 ──
+
+async def test_llm_connection(provider_id: str, api_key: str, model: str, base_url: str) -> dict:
+    """测试 LLM 连接是否可用"""
+    import time
+    start = time.time()
+    try:
+        if provider_id == "free":
+            return {"ok": True, "message": "免费内置模型无需测试", "time_ms": 0}
+
+        if provider_id == "anthropic":
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model or "claude-haiku-3-5",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Say OK"}],
+            }
+            url = f"{base_url.rstrip('/')}/messages"
+        elif provider_id == "gemini":
+            url = f"{base_url.rstrip('/')}/models/{model or 'gemini-2.0-flash'}:generateContent?key={api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": "Say OK"}]}],
+                "generationConfig": {"maxOutputTokens": 10},
+            }
+            headers = {"Content-Type": "application/json"}
+        else:
+            # OpenAI 兼容 (openai, deepseek, custom)
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model or "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "Say OK"}],
+                "max_tokens": 10,
+            }
+            url = f"{base_url.rstrip('/')}/chat/completions"
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            elapsed = round((time.time() - start) * 1000)
+            if resp.status_code == 200:
+                return {"ok": True, "message": f"连接成功 ({resp.status_code})", "time_ms": elapsed}
+            else:
+                body = resp.text[:200]
+                return {"ok": False, "message": f"HTTP {resp.status_code}: {body}", "time_ms": elapsed}
+    except httpx.TimeoutException:
+        elapsed = round((time.time() - start) * 1000)
+        return {"ok": False, "message": "连接超时 (15s)", "time_ms": elapsed}
+    except Exception as e:
+        elapsed = round((time.time() - start) * 1000)
+        return {"ok": False, "message": f"{type(e).__name__}: {str(e)[:100]}", "time_ms": elapsed}
 
 
 # Parse response 静态方法
